@@ -390,6 +390,15 @@ export interface OpenCodeSDKConfig {
    * @default false
    */
   enable_streaming?: boolean;
+
+  /**
+   * When true, the provider restarts the OpenCode server whenever the per-call
+   * traceparent changes, so that `trajectory:*` assertions can correlate
+   * OpenTelemetry spans back to the correct test case. This has a real perf
+   * cost (server restart per trace change) and is disabled by default.
+   * @default false
+   */
+  restart_server_per_call?: boolean;
 }
 
 /**
@@ -855,6 +864,8 @@ export class OpenCodeSDKProvider implements ApiProvider {
   private sessionQueues = new Map<string, Promise<void>>();
   private readonly credentialCacheScope = crypto.randomUUID();
   private streamingWarningEmitted = false;
+  private activeTraceparent?: string;
+  private callSerialization?: Promise<void>;
 
   constructor(
     options: {
@@ -1307,10 +1318,15 @@ export class OpenCodeSDKProvider implements ApiProvider {
     return this.opencodeModule;
   }
 
-  private async ensureClient(config: OpenCodeSDKConfig): Promise<void> {
+  private async ensureClient(config: OpenCodeSDKConfig, traceparent?: string): Promise<void> {
     const opencodeModule = await this.ensureOpenCodeModule();
 
     this.validateSessionPolicyConfiguration(config);
+
+    if (config.restart_server_per_call && traceparent !== this.activeTraceparent) {
+      await this.restartServer();
+      this.activeTraceparent = traceparent;
+    }
 
     if (this.client) {
       return;
@@ -1347,6 +1363,12 @@ export class OpenCodeSDKProvider implements ApiProvider {
         serverOptions.config = serverConfig;
       }
 
+      if (traceparent) {
+        process.env.OPENCODE_TRACEPARENT = traceparent;
+      } else {
+        delete process.env.OPENCODE_TRACEPARENT;
+      }
+
       const opencode = await createOpencode(serverOptions);
       this.client = opencode.client;
       this.server = opencode.server;
@@ -1360,6 +1382,21 @@ export class OpenCodeSDKProvider implements ApiProvider {
         this.clientInitialization = undefined;
       }
     }
+  }
+
+  private async restartServer(): Promise<void> {
+    if (this.server) {
+      try {
+        this.server.close();
+      } catch (err) {
+        logger.debug(`Failed to close OpenCode server during restart: ${err}`);
+      }
+    }
+    this.client = undefined;
+    this.server = undefined;
+    this.sessions.clear();
+    this.sessionOrder = [];
+    this.sessionQueues.clear();
   }
 
   private validateSessionPolicyConfiguration(config: OpenCodeSDKConfig): void {
